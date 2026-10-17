@@ -6,7 +6,7 @@ const key = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
 const supabase = url && key ? createClient(url, key) : null;
 const roomFromUrl = new URLSearchParams(location.search).get('room') ?? '';
 const sessionId = crypto.randomUUID();
-type Signal = { kind: 'offer'; sdp: RTCSessionDescriptionInit } | { kind: 'answer'; sdp: RTCSessionDescriptionInit } | { kind: 'ice'; candidate: RTCIceCandidateInit };
+type Signal = { kind: 'offer'; sdp: RTCSessionDescriptionInit } | { kind: 'answer'; sdp: RTCSessionDescriptionInit } | { kind: 'ice'; candidate: RTCIceCandidateInit } | { kind: 'camera'; enabled: boolean };
 type Wire = { sender: string; signal: Signal };
 type Member = { id: string; joined: number };
 type Phase = 'idle' | 'joining' | 'waiting' | 'connecting' | 'connected' | 'error';
@@ -17,10 +17,19 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [muted, setMuted] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [cameraOn, setCameraOn] = useState(false);
+  const [cameraBusy, setCameraBusy] = useState(false);
+  const [remoteCameraOn, setRemoteCameraOn] = useState(false);
   const channel = useRef<RealtimeChannel | null>(null);
   const peer = useRef<RTCPeerConnection | null>(null);
   const local = useRef<MediaStream | null>(null);
   const audio = useRef<HTMLAudioElement | null>(null);
+  const localVideo = useRef<HTMLVideoElement | null>(null);
+  const remoteVideo = useRef<HTMLVideoElement | null>(null);
+  const cameraStream = useRef<MediaStream | null>(null);
+  const videoSender = useRef<RTCRtpSender | null>(null);
+  const cameraRequest = useRef(0);
+  const cameraBusyRef = useRef(false);
   const remoteId = useRef<string | null>(null);
   const makingOffer = useRef(false);
   const pendingIce = useRef<RTCIceCandidateInit[]>([]);
@@ -30,21 +39,32 @@ export default function App() {
   function closePeer() {
     peer.current?.close(); peer.current = null;
     if (audio.current) audio.current.srcObject = null;
+    if (remoteVideo.current) remoteVideo.current.srcObject = null;
+    videoSender.current = null;
+    setRemoteCameraOn(false);
     pendingIce.current = []; makingOffer.current = false;
   }
   function cleanup() {
     live.current = false;
+    cameraRequest.current += 1;
+    cameraBusyRef.current = false;
+    cameraStream.current?.getTracks().forEach(t => t.stop());
+    cameraStream.current = null;
+    setCameraOn(false); setCameraBusy(false);
     closePeer();
     local.current?.getTracks().forEach(t => t.stop()); local.current = null;
     if (channel.current && supabase) void supabase.removeChannel(channel.current);
     channel.current = null; remoteId.current = null; currentRoom.current = '';
   }
   useEffect(() => () => cleanup(), []);
+  useEffect(() => {
+    if (localVideo.current) localVideo.current.srcObject = cameraOn ? cameraStream.current : null;
+  }, [cameraOn]);
 
   async function send(signal: Signal) {
     if (!channel.current) return;
     const result = await channel.current.send({ type: 'broadcast', event: 'signal', payload: { sender: sessionId, signal } satisfies Wire });
-    if (result !== 'ok') throw new Error('Signaling delivery failed: ' + result);
+    if (result !== 'ok') throw new Error('Ошибка передачи сигнала: ' + result);
   }
 
   function createPeer() {
@@ -55,14 +75,33 @@ export default function App() {
     }
     const pc = new RTCPeerConnection({ iceServers });
     peer.current = pc;
-    local.current?.getTracks().forEach(t => pc.addTrack(t, local.current!));
+    local.current?.getAudioTracks().forEach(t => pc.addTrack(t, local.current!));
+    // Negotiate a video m-line during the initial audio call. Later camera toggles
+    // only replace the sender track, avoiding disruptive SDP renegotiation.
+    const existingVideo = cameraStream.current?.getVideoTracks()[0];
+    const videoTransceiver = existingVideo
+      ? pc.addTransceiver(existingVideo, { direction: 'sendrecv' })
+      : pc.addTransceiver('video', { direction: 'sendrecv' });
+    videoSender.current = videoTransceiver.sender;
     pc.onicecandidate = e => { if (e.candidate) void send({ kind: 'ice', candidate: e.candidate.toJSON() }).catch(fail); };
-    pc.ontrack = e => { if (audio.current) { audio.current.srcObject = e.streams[0]; void audio.current.play().catch(() => setMessage('Tap Play audio to hear the other person.')); } };
+    pc.ontrack = e => {
+      if (e.track.kind === 'audio' && audio.current) {
+        audio.current.srcObject = new MediaStream([e.track]);
+        void audio.current.play().catch(() => setMessage('Нажмите кнопку воспроизведения, чтобы услышать собеседника.'));
+      }
+      if (e.track.kind === 'video' && remoteVideo.current) {
+        remoteVideo.current.srcObject = new MediaStream([e.track]);
+        void remoteVideo.current.play().catch(() => {});
+      }
+    };
     pc.onconnectionstatechange = () => {
       if (!live.current || peer.current !== pc) return;
-      if (pc.connectionState === 'connected') { setPhase('connected'); setMessage('Audio connected'); }
-      if (pc.connectionState === 'disconnected') { setPhase('connecting'); setMessage('Connection interrupted; trying to recover…'); }
-      if (pc.connectionState === 'failed') fail(new Error('Connection failed. Configure a TURN server or try another network.'));
+      if (pc.connectionState === 'connected') {
+        setPhase('connected'); setMessage('Связь установлена');
+        void send({ kind: 'camera', enabled: !!cameraStream.current }).catch(console.error);
+      }
+      if (pc.connectionState === 'disconnected') { setPhase('connecting'); setMessage('Связь прервалась. Пробуем восстановить соединение…'); }
+      if (pc.connectionState === 'failed') fail(new Error('Не удалось установить соединение. Попробуйте другую сеть или настройте TURN-сервер.'));
     };
     return pc;
   }
@@ -72,6 +111,7 @@ export default function App() {
   async function handleSignal(wire: Wire) {
     if (!live.current || wire.sender === sessionId || wire.sender !== remoteId.current) return;
     const s = wire.signal;
+    if (s.kind === 'camera') { setRemoteCameraOn(s.enabled); return; }
     if (s.kind === 'ice') {
       if (peer.current?.remoteDescription) await peer.current.addIceCandidate(s.candidate);
       else pendingIce.current.push(s.candidate);
@@ -99,7 +139,7 @@ export default function App() {
       const pc = createPeer();
       await pc.setLocalDescription(await pc.createOffer());
       await send({ kind: 'offer', sdp: pc.localDescription!.toJSON() });
-      setPhase('connecting'); setMessage('Connecting audio…');
+      setPhase('connecting'); setMessage('Устанавливаем аудиосвязь…');
     } finally { makingOffer.current = false; }
   }
   function fail(error: unknown) {
@@ -108,10 +148,10 @@ export default function App() {
     setMessage(error instanceof Error ? error.message : String(error));
   }
   async function join() {
-    if (!supabase) { setPhase('error'); setMessage('Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY first.'); return; }
+    if (!supabase) { setPhase('error'); setMessage('Сначала настройте VITE_SUPABASE_URL и VITE_SUPABASE_ANON_KEY.'); return; }
     const value = room.trim();
-    if (!/^[a-zA-Z0-9_-]{12,128}$/.test(value)) { setPhase('error'); setMessage('Room ID must be 12–128 letters, numbers, underscores or hyphens. Use Create room.'); return; }
-    cleanup(); setPhase('joining'); setMessage('Requesting microphone…');
+    if (!/^[a-zA-Z0-9_-]{12,128}$/.test(value)) { setPhase('error'); setMessage('ID комнаты должен содержать от 12 до 128 латинских букв, цифр, подчёркиваний или дефисов. Нажмите «Создать комнату».'); return; }
+    cleanup(); setPhase('joining'); setMessage('Запрашиваем доступ к микрофону…');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
       local.current = stream; live.current = true; currentRoom.current = value;
@@ -122,15 +162,15 @@ export default function App() {
       ch.on('presence', { event: 'sync' }, () => {
         if (!live.current || channel.current !== ch) return;
         const members = Object.values(ch.presenceState()).flatMap(entries => entries as unknown as Member[]).sort((a,b) => a.joined - b.joined || a.id.localeCompare(b.id));
-        if (members.length > 2) { fail(new Error('This room already has two people.')); return; }
+        if (members.length > 2) { fail(new Error('В этой комнате уже два участника.')); return; }
         const other = members.find(m => m.id !== sessionId);
         if (!other) {
           if (remoteId.current) { closePeer(); remoteId.current = null; }
-          setPhase('waiting'); setMessage('Waiting for the other person to join…'); return;
+          setPhase('waiting'); setMessage('Ожидаем, когда собеседник присоединится…'); return;
         }
         if (remoteId.current !== other.id) { closePeer(); remoteId.current = other.id; }
         if (members[0]?.id === sessionId) void offer().catch(fail);
-        else { setPhase('connecting'); setMessage('Connecting to the other person…'); }
+        else { setPhase('connecting'); setMessage('Соединяем с собеседником…'); }
       });
       ch.subscribe(async status => {
         if (!live.current || channel.current !== ch) return;
@@ -138,11 +178,50 @@ export default function App() {
           try { await ch.track({ id: sessionId, joined: Date.now() } satisfies Member); }
           catch (e) { fail(e); }
         }
-        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') fail(new Error('Realtime connection failed. Check Supabase configuration.'));
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') fail(new Error('Ошибка подключения. Проверьте настройки Supabase.'));
       });
     } catch (e) { fail(e); }
   }
-  function leave() { cleanup(); setPhase('idle'); setMessage('Call ended.'); setMuted(false); }
+  async function toggleCamera() {
+    if (!live.current || cameraBusyRef.current) return;
+    cameraBusyRef.current = true;
+    setCameraBusy(true);
+    const request = ++cameraRequest.current;
+    try {
+      if (cameraStream.current) {
+        await videoSender.current?.replaceTrack(null);
+        cameraStream.current.getTracks().forEach(t => t.stop());
+        cameraStream.current = null;
+        setCameraOn(false);
+        if (remoteId.current) void send({ kind: 'camera', enabled: false }).catch(console.error);
+      } else {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+        if (!live.current || request !== cameraRequest.current) {
+          stream.getTracks().forEach(t => t.stop());
+          return;
+        }
+        const track = stream.getVideoTracks()[0];
+        try { await videoSender.current?.replaceTrack(track); }
+        catch (error) { stream.getTracks().forEach(t => t.stop()); throw error; }
+        if (!live.current || request !== cameraRequest.current) {
+          stream.getTracks().forEach(t => t.stop());
+          return;
+        }
+        cameraStream.current = stream;
+        setCameraOn(true);
+        if (remoteId.current) void send({ kind: 'camera', enabled: true }).catch(console.error);
+      }
+    } catch (error) {
+      console.error('Camera error:', error);
+      setMessage('Не удалось включить камеру. Проверьте разрешения браузера.');
+    } finally {
+      if (request === cameraRequest.current) {
+        cameraBusyRef.current = false;
+        setCameraBusy(false);
+      }
+    }
+  }
+  function leave() { cleanup(); setPhase('idle'); setMessage('Звонок завершён.'); setMuted(false); }
   function toggleMute() {
     const next = !muted;
     local.current?.getAudioTracks().forEach(t => { t.enabled = !next; }); setMuted(next);
@@ -151,14 +230,29 @@ export default function App() {
   async function copyLink() { await navigator.clipboard.writeText(location.origin + '/?room=' + encodeURIComponent(room.trim())); setCopied(true); }
   const active = phase === 'joining' || phase === 'waiting' || phase === 'connecting' || phase === 'connected';
   return <main className="shell"><section className="panel">
-    <div className="brand"><span className="logo">♫</span><span>FAMILY VOICE</span></div>
-    <h1>Stay close,<br/><em>wherever you are.</em></h1>
-    <p className="sub">A private two-person voice room. No download required.</p>
-    <div className="field"><label htmlFor="room">ROOM LINK</label><div className="inputrow"><input id="room" value={room} onChange={e => setRoom(e.target.value)} disabled={active} placeholder="Create a room or paste its ID"/><button className="small" onClick={createRoom} disabled={active}>New</button></div></div>
-    <div className="actions"><button className="primary" disabled={active || !room.trim()} onClick={() => void join()}>{active ? 'In room' : 'Join voice room'} →</button><button className="secondary" disabled={!room.trim()} onClick={() => void copyLink().catch(fail)}>{copied ? 'Copied!' : 'Copy invite link'}</button></div>
-    <div className="callbox"><div className={'pulse ' + (phase === 'connected' ? 'online' : '')}>◉</div><div><strong>{({ idle:'Ready to connect', joining:'Joining…', waiting:'Waiting for someone', connecting:'Connecting…', connected:'You are connected', error:'Something went wrong' } as Record<Phase,string>)[phase]}</strong><p role="status">{message || 'Create a room, share its link, and join from both browsers.'}</p></div></div>
-    {active && <div className="controls"><button onClick={toggleMute}>{muted ? 'Unmute microphone' : 'Mute microphone'}</button><button className="hangup" onClick={leave}>Leave call</button></div>}
+    <div className="brand"><span className="logo">♫</span><span>СЕМЕЙНАЯ СВЯЗЬ</span></div>
+    <h1>Будьте рядом,<br/><em>где бы вы ни были.</em></h1>
+    <p className="sub">Личный голосовой звонок для двоих. Ничего устанавливать не нужно.</p>
+    <div className="field"><label htmlFor="room">ССЫЛКА НА КОМНАТУ</label><div className="inputrow"><input id="room" value={room} onChange={e => setRoom(e.target.value)} disabled={active} placeholder="Создайте комнату или вставьте её ID"/><button className="small" onClick={createRoom} disabled={active}>Создать</button></div></div>
+    <div className="actions"><button className="primary" disabled={active || !room.trim()} onClick={() => void join()}>{active ? 'Вы в комнате' : 'Присоединиться к звонку'} →</button><button className="secondary" disabled={!room.trim()} onClick={() => void copyLink().catch(fail)}>{copied ? 'Скопировано!' : 'Скопировать ссылку'}</button></div>
+    <div className="callbox"><div className={'pulse ' + (phase === 'connected' ? 'online' : '')}>◉</div><div><strong>{({ idle:'Готовы к звонку', joining:'Подключаемся…', waiting:'Ожидаем собеседника', connecting:'Соединяем…', connected:'Связь установлена', error:'Произошла ошибка' } as Record<Phase,string>)[phase]}</strong><p role="status">{message || 'Создайте комнату, отправьте ссылку близкому человеку и откройте её в обоих браузерах.'}</p></div></div>
+    {active && <div className="controls">
+      <button onClick={toggleMute}>{muted ? 'Включить микрофон' : 'Выключить микрофон'}</button>
+      <button onClick={() => void toggleCamera()} disabled={cameraBusy || phase === 'joining'}>{cameraBusy ? 'Подождите…' : cameraOn ? 'Выключить камеру' : 'Включить камеру'}</button>
+      <button className="hangup" onClick={leave}>Завершить звонок</button>
+    </div>}
+    {active && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 220px), 1fr))', gap: 12, marginTop: 16 }}>
+      <div style={{ position: 'relative', borderRadius: 12, overflow: 'hidden', background: '#1b2330', minHeight: 170 }}>
+        <video ref={remoteVideo} autoPlay playsInline style={{ width: '100%', aspectRatio: '4 / 3', objectFit: 'cover', display: remoteCameraOn ? 'block' : 'none' }} />
+        {!remoteCameraOn && <div style={{ padding: 24, color: '#fff', textAlign: 'center' }}>Камера собеседника выключена</div>}
+        <div style={{ position: 'absolute', bottom: 8, left: 8, color: '#fff', background: '#0009', padding: '3px 8px', borderRadius: 6 }}>Собеседник</div>
+      </div>
+      {cameraOn && <div style={{ position: 'relative', borderRadius: 12, overflow: 'hidden', background: '#1b2330' }}>
+        <video ref={localVideo} autoPlay muted playsInline style={{ width: '100%', aspectRatio: '4 / 3', objectFit: 'cover', transform: 'scaleX(-1)' }} />
+        <div style={{ position: 'absolute', bottom: 8, left: 8, color: '#fff', background: '#0009', padding: '3px 8px', borderRadius: 6 }}>Вы</div>
+      </div>}
+    </div>}
     <audio ref={audio} autoPlay playsInline controls className="remote-audio" />
-    <p className="foot">Audio only · Encrypted WebRTC · Keep this page open during your call</p>
+    <p className="foot">Голос и видео · Защищённая связь WebRTC · Не закрывайте страницу во время звонка</p>
   </section></main>;
 }

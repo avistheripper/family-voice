@@ -1,61 +1,80 @@
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ ! -f src/App.tsx ]]; then echo 'Run this from the family-voice project root.' >&2; exit 1; fi
-if ! command -v node >/dev/null 2>&1; then echo 'Node.js is required.' >&2; exit 1; fi
+cd "$(dirname "$0")"
+command -v node >/dev/null || { echo 'Node.js is required'; exit 1; }
+[ -f src/App.tsx ] || { echo 'Run this script from the family-voice project root.'; exit 1; }
 node <<'JS'
 const fs = require('fs');
 const path = 'src/App.tsx';
-let code = fs.readFileSync(path, 'utf8');
-const replacements = [
+let s = fs.readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+const patches = [
   [
-`      if (e.track.kind === 'video' && remoteVideo.current) {
-        remoteVideo.current.srcObject = new MediaStream([e.track]);
-        void remoteVideo.current.play().catch(() => {});
-      }`,
-`      if (e.track.kind === 'video') {
-        const video = remoteVideo.current;
-        if (video) {
-          video.srcObject = new MediaStream([e.track]);
-          // The remote video is muted because audio plays through the separate
-          // <audio> element. This also helps iOS Safari autoplay video.
-          video.muted = true;
-          const resume = () => { void video.play().catch(error => console.warn('Remote video playback:', error)); };
-          e.track.addEventListener('unmute', resume);
-          video.addEventListener('loadedmetadata', resume, { once: true });
-          resume();
-        }
-      }`
+`  function createPeer() {
+`,
+`  function createPeer(answering = false) {
+`
   ],
   [
-`    if (localVideo.current) localVideo.current.srcObject = cameraOn ? cameraStream.current : null;
-  }, [cameraOn]);`,
-`    if (localVideo.current) localVideo.current.srcObject = cameraOn ? cameraStream.current : null;
-  }, [cameraOn]);
-  useEffect(() => {
-    if (remoteCameraOn && remoteVideo.current) {
-      void remoteVideo.current.play().catch(error => console.warn('Remote video playback:', error));
+`    // Negotiate a video m-line during the initial audio call. Later camera toggles
+    // only replace the sender track, avoiding disruptive SDP renegotiation.
+    const existingVideo = cameraStream.current?.getVideoTracks()[0];
+    const videoTransceiver = existingVideo
+      ? pc.addTransceiver(existingVideo, { direction: 'sendrecv' })
+      : pc.addTransceiver('video', { direction: 'sendrecv' });
+    videoSender.current = videoTransceiver.sender;
+`,
+`    // The offerer creates the video m-line. The answerer must reuse that
+    // negotiated transceiver after setRemoteDescription, not create another.
+    if (!answering) {
+      const existingVideo = cameraStream.current?.getVideoTracks()[0];
+      const videoTransceiver = existingVideo
+        ? pc.addTransceiver(existingVideo, { direction: 'sendrecv' })
+        : pc.addTransceiver('video', { direction: 'sendrecv' });
+      videoSender.current = videoTransceiver.sender;
     }
-  }, [remoteCameraOn]);`
+`
   ],
   [
-`<video ref={remoteVideo} autoPlay playsInline style={{ width: '100%', aspectRatio: '4 / 3', objectFit: 'cover', display: remoteCameraOn ? 'block' : 'none' }} />`,
-`<video ref={remoteVideo} autoPlay muted playsInline style={{ width: '100%', aspectRatio: '4 / 3', objectFit: 'cover', background: '#1b2330' }} />`
-  ],
-  [
-`{!remoteCameraOn && <div style={{ padding: 24, color: '#fff', textAlign: 'center' }}>Камера собеседника выключена</div>}`,
-`{!remoteCameraOn && <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', padding: 24, color: '#fff', textAlign: 'center', background: '#1b2330' }}>Камера собеседника выключена</div>}`
+`    if (s.kind === 'offer') {
+      const pc = createPeer();
+      if (pc.signalingState !== 'stable') return;
+      await pc.setRemoteDescription(s.sdp);
+      await flushIce(pc);
+      await pc.setLocalDescription(await pc.createAnswer());
+`,
+`    if (s.kind === 'offer') {
+      const pc = createPeer(true);
+      if (pc.signalingState !== 'stable') return;
+      await pc.setRemoteDescription(s.sdp);
+      // setRemoteDescription creates the matching video transceiver on the
+      // answerer. Explicitly enable sending in the SDP answer.
+      const videoTransceiver = pc.getTransceivers().find(t =>
+        t.receiver.track.kind === 'video' &&
+t.currentDirection !== 'stopped'
+      );
+      if (!videoTransceiver) throw new Error('Не удалось согласовать видеосвязь.');
+      videoTransceiver.direction = 'sendrecv';
+      videoSender.current = videoTransceiver.sender;
+      const cameraTrack = cameraStream.current?.getVideoTracks()[0] ?? null;
+      if (cameraTrack) await videoSender.current.replaceTrack(cameraTrack);
+      await flushIce(pc);
+      await pc.setLocalDescription(await pc.createAnswer());
+`
   ]
 ];
-let changed = 0;
-for (const [before, after] of replacements) {
-  if (code.includes(after)) { console.log('Already patched one section.'); continue; }
-  if (!code.includes(before)) { console.error('Expected code not found; stopping without changes:\n' + before.slice(0,120)); process.exit(1); }
-  code = code.replace(before, after); changed++;
+let updated = 0;
+for (const [before, after] of patches) {
+  const count = s.split(before).length - 1;
+  if (count !== 1) {
+    console.error(`Patch mismatch: expected one occurrence, found ${count}. No files changed.`);
+    process.exit(1);
+  }
+  s = s.replace(before, after);
+  updated++;
 }
-if (!changed) { console.log('Already patched.'); process.exit(0); }
-fs.copyFileSync(path, 'src/App.tsx.before-video-fix.bak');
-fs.writeFileSync(path, code);
-console.log('Patched', changed, 'sections; backup saved.');
+fs.copyFileSync(path, 'src/App.tsx.before-direction-fix.bak');
+fs.writeFileSync(path, s);
+console.log(`Applied ${updated} patches. Backup: src/App.tsx.before-direction-fix.bak`);
 JS
 npm run build
-printf '\nBuild passed. Commit and push to deploy.\n'
+echo 'Build successful. Review git diff, then git add src/App.tsx && git commit && git push.'

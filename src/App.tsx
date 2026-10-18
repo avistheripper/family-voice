@@ -72,7 +72,7 @@ export default function App() {
     if (result !== 'ok') throw new Error('Ошибка передачи сигнала: ' + result);
   }
 
-  function createPeer() {
+  function createPeer(answering = false) {
     if (peer.current) return peer.current;
     const iceServers: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
     if (import.meta.env.VITE_TURN_URL && import.meta.env.VITE_TURN_USERNAME && import.meta.env.VITE_TURN_CREDENTIAL) {
@@ -81,13 +81,15 @@ export default function App() {
     const pc = new RTCPeerConnection({ iceServers });
     peer.current = pc;
     local.current?.getAudioTracks().forEach(t => pc.addTrack(t, local.current!));
-    // Negotiate a video m-line during the initial audio call. Later camera toggles
-    // only replace the sender track, avoiding disruptive SDP renegotiation.
-    const existingVideo = cameraStream.current?.getVideoTracks()[0];
-    const videoTransceiver = existingVideo
-      ? pc.addTransceiver(existingVideo, { direction: 'sendrecv' })
-      : pc.addTransceiver('video', { direction: 'sendrecv' });
-    videoSender.current = videoTransceiver.sender;
+    // The offerer creates the video m-line. The answerer must reuse that
+    // negotiated transceiver after setRemoteDescription, not create another.
+    if (!answering) {
+      const existingVideo = cameraStream.current?.getVideoTracks()[0];
+      const videoTransceiver = existingVideo
+        ? pc.addTransceiver(existingVideo, { direction: 'sendrecv' })
+        : pc.addTransceiver('video', { direction: 'sendrecv' });
+      videoSender.current = videoTransceiver.sender;
+    }
     pc.onicecandidate = e => { if (e.candidate) void send({ kind: 'ice', candidate: e.candidate.toJSON() }).catch(fail); };
     pc.ontrack = e => {
       if (e.track.kind === 'audio' && audio.current) {
@@ -132,9 +134,20 @@ export default function App() {
       return;
     }
     if (s.kind === 'offer') {
-      const pc = createPeer();
+      const pc = createPeer(true);
       if (pc.signalingState !== 'stable') return;
       await pc.setRemoteDescription(s.sdp);
+      // setRemoteDescription creates the matching video transceiver on the
+      // answerer. Explicitly enable sending in the SDP answer.
+      const videoTransceiver = pc.getTransceivers().find(t =>
+        t.receiver.track.kind === 'video' &&
+t.currentDirection !== 'stopped'
+      );
+      if (!videoTransceiver) throw new Error('Не удалось согласовать видеосвязь.');
+      videoTransceiver.direction = 'sendrecv';
+      videoSender.current = videoTransceiver.sender;
+      const cameraTrack = cameraStream.current?.getVideoTracks()[0] ?? null;
+      if (cameraTrack) await videoSender.current.replaceTrack(cameraTrack);
       await flushIce(pc);
       await pc.setLocalDescription(await pc.createAnswer());
       await send({ kind: 'answer', sdp: pc.localDescription!.toJSON() });

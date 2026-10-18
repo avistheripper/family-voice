@@ -60,6 +60,11 @@ export default function App() {
   useEffect(() => {
     if (localVideo.current) localVideo.current.srcObject = cameraOn ? cameraStream.current : null;
   }, [cameraOn]);
+  useEffect(() => {
+    if (remoteCameraOn && remoteVideo.current) {
+      void remoteVideo.current.play().catch(error => console.warn('Remote video playback:', error));
+    }
+  }, [remoteCameraOn]);
 
   async function send(signal: Signal) {
     if (!channel.current) return;
@@ -89,9 +94,18 @@ export default function App() {
         audio.current.srcObject = new MediaStream([e.track]);
         void audio.current.play().catch(() => setMessage('Нажмите кнопку воспроизведения, чтобы услышать собеседника.'));
       }
-      if (e.track.kind === 'video' && remoteVideo.current) {
-        remoteVideo.current.srcObject = new MediaStream([e.track]);
-        void remoteVideo.current.play().catch(() => {});
+      if (e.track.kind === 'video') {
+        const video = remoteVideo.current;
+        if (video) {
+          video.srcObject = new MediaStream([e.track]);
+          // The remote video is muted because audio plays through the separate
+          // <audio> element. This also helps iOS Safari autoplay video.
+          video.muted = true;
+          const resume = () => { void video.play().catch(error => console.warn('Remote video playback:', error)); };
+          e.track.addEventListener('unmute', resume);
+          video.addEventListener('loadedmetadata', resume, { once: true });
+          resume();
+        }
       }
     };
     pc.onconnectionstatechange = () => {
@@ -243,8 +257,8 @@ export default function App() {
     </div>}
     {active && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 220px), 1fr))', gap: 12, marginTop: 16 }}>
       <div style={{ position: 'relative', borderRadius: 12, overflow: 'hidden', background: '#1b2330', minHeight: 170 }}>
-        <video ref={remoteVideo} autoPlay playsInline style={{ width: '100%', aspectRatio: '4 / 3', objectFit: 'cover', display: remoteCameraOn ? 'block' : 'none' }} />
-        {!remoteCameraOn && <div style={{ padding: 24, color: '#fff', textAlign: 'center' }}>Камера собеседника выключена</div>}
+        <video ref={remoteVideo} autoPlay muted playsInline style={{ width: '100%', aspectRatio: '4 / 3', objectFit: 'cover', background: '#1b2330' }} />
+        {!remoteCameraOn && <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', padding: 24, color: '#fff', textAlign: 'center', background: '#1b2330' }}>Камера собеседника выключена</div>}
         <div style={{ position: 'absolute', bottom: 8, left: 8, color: '#fff', background: '#0009', padding: '3px 8px', borderRadius: 6 }}>Собеседник</div>
       </div>
       {cameraOn && <div style={{ position: 'relative', borderRadius: 12, overflow: 'hidden', background: '#1b2330' }}>
